@@ -68,7 +68,7 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use octo_crypto::{master_key_from_slice, MASTER_KEY_LEN};
+use octo_crypto::{master_key_from_slice, reseal_with_account_id, MASTER_KEY_LEN, SCHEME_V2};
 use octo_store::Store;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
 
     loop {
         let batch = store
-            .list_wallets_needing_reseal(SCHEME_V1 as i16, cfg.batch_size, after_id)
+            .list_wallets_needing_reseal(SCHEME_V2 as i16, cfg.batch_size, after_id)
             .await
             .context("list_wallets_needing_reseal")?;
 
@@ -150,17 +150,32 @@ async fn main() -> Result<()> {
                 ciphertext.clone(),
                 nonce,
                 salt,
-                scheme as u8,
+                u8::try_from(scheme).context("sealed scheme must fit in an unsigned byte")?,
             )
             .with_context(|| format!("from_parts wallet {}", wallet.id))?;
 
             // Context is the network string bound into the AEAD AAD (e.g. "octo:mainnet").
             let context = format!("octo:{}", wallet.network);
+            let account_id = wallet
+                .gas_tank_account_g
+                .as_deref()
+                .unwrap_or(&wallet.stellar_account_g);
 
-            // reseal: open under old key → re-seal under new key (Zeroizing throughout).
-            let new_sealed = reseal(&cfg.old_key, &cfg.new_key, &sealed, context.as_bytes())
+            // Reseal into the account-bound scheme (Zeroizing throughout).
+            let new_sealed = reseal_with_account_id(
+                &cfg.old_key,
+                &cfg.new_key,
+                &sealed,
+                context.as_bytes(),
+                account_id,
+            )
                 .with_context(|| format!("reseal wallet {}", wallet.id))?;
 
+            if cfg.dry_run {
+                total_skipped += 1;
+                tracing::info!(wallet_id = %wallet.id, "dry-run: would migrate wallet");
+                continue;
+            }
             // Atomically swap the DB record. The idempotency guard (expected_old_scheme)
             // means a concurrent run that already migrated this wallet is a safe no-op.
             let updated = store
@@ -169,7 +184,7 @@ async fn main() -> Result<()> {
                     &new_sealed.ciphertext,
                     &new_sealed.nonce,
                     &new_sealed.salt,
-                    SCHEME_V1 as i16,
+                    SCHEME_V2 as i16,
                     scheme,
                 )
                 .await
@@ -187,8 +202,10 @@ async fn main() -> Result<()> {
         // Advance the cursor to the last wallet in this batch (ids are ordered ASC), and persist
         // it only now that every row in the batch is done, so a resume never skips a row.
         after_id = batch.last().map(|w| w.id);
-        if let Some(id) = after_id {
-            write_checkpoint(&cfg.checkpoint_path, &fingerprint, id)?;
+        if !cfg.dry_run {
+            if let Some(id) = after_id {
+                write_checkpoint(&cfg.checkpoint_path, &fingerprint, id)?;
+            }
         }
         batches_completed += 1;
         tracing::info!(
@@ -200,7 +217,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    remove_checkpoint(&cfg.checkpoint_path)?;
+    if !cfg.dry_run {
+        remove_checkpoint(&cfg.checkpoint_path)?;
+    }
     tracing::info!(
         batches_completed,
         total_migrated,
@@ -284,6 +303,7 @@ struct Config {
     new_key: [u8; MASTER_KEY_LEN],
     batch_size: i64,
     checkpoint_path: PathBuf,
+    dry_run: bool,
 }
 
 impl Config {
@@ -316,6 +336,7 @@ impl Config {
         let checkpoint_path = std::env::var("MIGRATE_KEYS_CHECKPOINT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_CHECKPOINT_PATH));
+        let dry_run = std::env::args().any(|arg| arg == "--dry-run");
 
         Ok(Config {
             database_url,
@@ -323,6 +344,7 @@ impl Config {
             new_key,
             batch_size,
             checkpoint_path,
+            dry_run,
         })
     }
 }

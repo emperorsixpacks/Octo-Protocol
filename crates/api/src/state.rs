@@ -2,20 +2,40 @@
 
 use crate::error::ApiError;
 use crate::horizon::Horizon;
+use crate::signing_policy::SigningPolicy;
 use base64::Engine;
-use octo_crypto::{master_key_from_slice, MASTER_KEY_LEN};
+use octo_crypto::{CryptoError, MASTER_KEY_LEN};
 use octo_email::EmailSender;
 use octo_resilience::{CircuitBreaker, RetryPolicy};
-use octo_store::Store;
+use octo_store::{AuditChainKey, Store, AUDIT_CHAIN_KEY_LEN};
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::sync::Arc;
+use std::{collections::HashMap, fmt, fmt::Formatter};
 use zeroize::Zeroizing;
 
 /// Cloneable, shared API state.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
+}
+
+impl fmt::Debug for AppState {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppState")
+            .field("network", &self.inner.network)
+            .field("horizon_url", &self.inner.horizon_url)
+            .field("signing_policy", &self.inner.signing_policy)
+            .field("friendbot_url", &self.inner.friendbot_url)
+            .field("public_app_url", &self.inner.public_app_url)
+            .field("public_api_host", &self.inner.public_api_host)
+            .field("master_key", &"[REDACTED]")
+            .field("master_key_next", &self.inner.master_key_next.as_ref().map(|_| "[REDACTED]"))
+            .field("jwt_secret", &"[REDACTED]")
+            .field("cloudinary", &self.inner.cloudinary.as_ref().map(|_| "[REDACTED]"))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -30,6 +50,7 @@ struct Inner {
     network: StellarNetwork,
     horizon: Horizon,
     horizon_url: String,
+    signing_policy: SigningPolicy,
     friendbot_url: Option<String>,
     /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
     /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
@@ -38,15 +59,19 @@ struct Inner {
     public_api_host: Option<String>,
     /// HMAC secret for signing dashboard auth JWTs.
     jwt_secret: Vec<u8>,
+    /// HMAC key for the tamper-evident audit chain (`AUDIT_CHAIN_KEY`).
+    audit_chain_key: AuditChainKey,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
     webhooks: WebhookSender,
     /// Sends OTP/welcome/withdrawal emails via Resend.
     email: EmailSender,
-    /// Per-IP rate limiting for auth + public endpoints.
+    /// Rate limiting for auth + public endpoints (in-memory or shared via Postgres).
     rate_limiter: crate::rate_limit::RateLimiter,
     /// Cloudinary credentials for signed image uploads; `None` when unconfigured, in which case
     /// the upload endpoint reports that the feature is off rather than failing obscurely.
     cloudinary: Option<CloudinaryConfig>,
+    /// Serializes submissions that share a Stellar account sequence.
+    sequence_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// Cloudinary credentials, read from the environment at startup.
@@ -90,7 +115,7 @@ impl AppState {
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
         Self::build(
             store,
-            master_key,
+            Zeroizing::new(master_key),
             None,
             network,
             horizon_url,
@@ -103,11 +128,12 @@ impl AppState {
         )
     }
 
-    /// Build state with explicit resilience configuration (used by `bin/server`).
+    /// Build state with explicit resilience configuration (used by `bin/server`). Takes the
+    /// master key already zeroizing, so no plain copy of it is left behind on the caller's stack.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_resilience(
         store: Store,
-        master_key: [u8; MASTER_KEY_LEN],
+        master_key: Zeroizing<[u8; MASTER_KEY_LEN]>,
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
@@ -141,6 +167,25 @@ impl AppState {
         self
     }
 
+    /// Configure parameters returned to clients that build and sign transactions locally.
+    pub fn with_signing_policy(mut self, policy: SigningPolicy) -> Self {
+        Arc::make_mut(&mut self.inner).signing_policy = policy;
+        self
+    }
+
+    /// Swap the rate-limit backend (defaults to per-process memory; use Postgres with replicas).
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::RateLimiter) -> Self {
+        Arc::make_mut(&mut self.inner).rate_limiter = limiter;
+        self
+    }
+
+    /// Set the audit chain HMAC key (from `AUDIT_CHAIN_KEY`). Without it a random per-process key
+    /// is used, which is fine for tests but breaks verification of chains across restarts.
+    pub fn with_audit_chain_key(mut self, key: AuditChainKey) -> Self {
+        Arc::make_mut(&mut self.inner).audit_chain_key = key;
+        self
+    }
+
     /// Configure the public API URL used to block direct webhook callbacks to this API.
     pub fn with_public_api_url(mut self, url: Option<&str>) -> Result<Self, &'static str> {
         let host = url
@@ -163,17 +208,17 @@ impl AppState {
     /// Set the next master key for zero-downtime key rotation.
     /// When set, new records are sealed under it and existing records are opened by trying it
     /// first, then `master_key` (see [`AppState::opening_keys`]).
-    pub fn with_master_key_next(mut self, key: [u8; MASTER_KEY_LEN]) -> Self {
+    pub fn with_master_key_next(mut self, key: Zeroizing<[u8; MASTER_KEY_LEN]>) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
-        inner.master_key_next = Some(Zeroizing::new(key));
+        inner.master_key_next = Some(key);
         self
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build(
         store: Store,
-        master_key: [u8; MASTER_KEY_LEN],
-        master_key_next: Option<[u8; MASTER_KEY_LEN]>,
+        master_key: Zeroizing<[u8; MASTER_KEY_LEN]>,
+        master_key_next: Option<Zeroizing<[u8; MASTER_KEY_LEN]>>,
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
@@ -185,35 +230,63 @@ impl AppState {
     ) -> Self {
         let horizon = Horizon::with_resilience(horizon_url.clone(), retry, circuit);
         let webhooks = WebhookSender::new(store.clone());
+        let mut audit_key = Zeroizing::new([0u8; AUDIT_CHAIN_KEY_LEN]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut audit_key[..]);
         Self {
             inner: Arc::new(Inner {
                 rate_limiter: crate::rate_limit::RateLimiter::default(),
                 cloudinary: CloudinaryConfig::from_env(),
+                sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 store,
-                master_key: Zeroizing::new(master_key),
-                master_key_next: master_key_next.map(Zeroizing::new),
+                master_key,
+                master_key_next,
                 network,
                 horizon,
                 horizon_url,
+                signing_policy: SigningPolicy::default(),
                 friendbot_url,
                 public_app_url,
                 public_api_host: None,
                 jwt_secret,
+                audit_chain_key: AuditChainKey::new(audit_key),
                 webhooks,
                 email,
             }),
         }
     }
 
-    /// Decode a base64 32-byte master key (from KMS/env) into raw bytes.
-    pub fn decode_master_key(b64: &str) -> Result<[u8; MASTER_KEY_LEN], ApiError> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
+    /// Decode a base64 32-byte key (from KMS/env). The decode buffer and the result are both
+    /// zeroizing, so no intermediate copy of the key outlives this call.
+    pub fn decode_master_key(b64: &str) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, ApiError> {
+        // Sized above any valid input (44 chars → 32 bytes) so the decoder never reallocates.
+        let mut raw = Zeroizing::new([0u8; 48]);
+        let len = base64::engine::general_purpose::STANDARD
+            .decode_slice(b64.trim(), &mut raw[..])
             .map_err(|_| ApiError::BadRequest("invalid MASTER_KEY (base64)".into()))?;
-        master_key_from_slice(&raw)
-            .map_err(|_| ApiError::BadRequest("MASTER_KEY must be 32 bytes".into()))
+        if len != MASTER_KEY_LEN {
+            let error = CryptoError::InvalidMasterKeyLength {
+                expected: MASTER_KEY_LEN,
+                actual: len,
+            };
+            return Err(ApiError::BadRequest(error.to_string()));
+        }
+        // Copy straight into the zeroizing result; a by-value array would leave a stack copy.
+        let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+        key.copy_from_slice(&raw[..len]);
+        Ok(key)
     }
 
+    /// Acquire the process-local lock for a source account before reading its sequence and
+    /// submitting a transaction. This prevents concurrent requests from signing/submitting the
+    /// same sequence; Horizon remains the final authority after process restarts.
+    pub async fn sequence_lock(&self, source_account: impl Into<String>) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = source_account.into();
+        let lock = {
+            let mut locks = self.inner.sequence_locks.lock().await;
+            locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        lock.lock_owned().await
+    }
     pub fn store(&self) -> &Store {
         &self.inner.store
     }
@@ -259,6 +332,10 @@ impl AppState {
             .chain(std::iter::once(&*self.inner.master_key))
     }
 
+    pub fn audit_chain_key(&self) -> &AuditChainKey {
+        &self.inner.audit_chain_key
+    }
+
     pub fn jwt_secret(&self) -> &[u8] {
         &self.inner.jwt_secret
     }
@@ -269,6 +346,10 @@ impl AppState {
 
     pub fn horizon(&self) -> &Horizon {
         &self.inner.horizon
+    }
+
+    pub fn signing_policy(&self) -> SigningPolicy {
+        self.inner.signing_policy
     }
 
     pub fn webhooks(&self) -> &WebhookSender {
